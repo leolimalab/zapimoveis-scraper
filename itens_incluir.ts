@@ -1,0 +1,14 @@
+Incluir:
+- IPTU
+- Descrição
+- Data de extração
+- Data de publicação
+- Data de atualização
+- Data de criação
+- Características do imóvel
+- Características do condomínio
+- Loja oficial do anunciante
+- Anunciante
+- Contato do anunciante
+- Avaliação do imóvel
+- Localização do imóvel (ex: Rua Gustavo Sampaio, 654 - Leme, Rio de Janeiro - RJ)
