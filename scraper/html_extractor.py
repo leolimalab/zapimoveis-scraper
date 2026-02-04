@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import re
+import traceback
 from typing import List, Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -211,67 +212,52 @@ class HTMLExtractor:
 
     async def _fetch_property_details(self, prop: Property) -> Property:
         """Busca dados adicionais da página de detalhe do imóvel."""
+        page = await self._context.new_page()
+
         try:
-            # Cria um novo contexto para evitar bloqueio do Cloudflare
-            detail_context = await self._browser.new_context(
-                user_agent=ScraperConfig.USER_AGENT,
-                viewport={"width": 1920, "height": 1080},
-                locale="pt-BR",
-            )
-            page = await detail_context.new_page()
+            await page.goto(prop.url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(3)
 
-            try:
-                # Aguarda navegação completa
-                await page.goto(prop.url, wait_until="networkidle", timeout=60000)
+            # Verifica se página carregou corretamente (não é Cloudflare challenge)
+            page_text = await page.evaluate("() => document.body.innerText")
+            if len(page_text) < 1000:
+                logger.warning(f"Página bloqueada pelo Cloudflare para {prop.id}")
+                return prop
 
-                # Aguarda mais tempo para garantir que a página carregou
-                await asyncio.sleep(4)
+            # Extrai dados adicionais do DOM
+            details = await self._extract_detail_data(page)
+            logger.debug(f"Details extraídos para {prop.id}: {details}")
 
-                # Verifica se página carregou corretamente (não é Cloudflare challenge)
-                page_text = await page.evaluate("() => document.body.innerText")
-                if len(page_text) < 1000:
-                    # Página bloqueada - log e skip
-                    logger.warning(f"Página bloqueada pelo Cloudflare para {prop.id}")
-                    await page.close()
-                    await detail_context.close()
-                    return prop
+            # Atualiza propriedade com dados adicionais
+            if details.get("iptu"):
+                prop.iptu = details["iptu"]
 
-                # Extrai dados adicionais do DOM
-                details = await self._extract_detail_data(page)
-                logger.debug(f"Details extraídos para {prop.id}: {details}")
+            if details.get("endereco_completo"):
+                prop.endereco_completo = details["endereco_completo"]
+                match = re.search(r',?\s*(\d+)', details["endereco_completo"])
+                if match:
+                    prop.numero = match.group(1)
 
-                # Atualiza propriedade com dados adicionais
-                if details.get("iptu"):
-                    prop.iptu = details["iptu"]
+            if details.get("anunciante"):
+                prop.anunciante = details["anunciante"]
 
-                if details.get("endereco_completo"):
-                    prop.endereco_completo = details["endereco_completo"]
-                    # Tenta extrair número
-                    match = re.search(r',?\s*(\d+)', details["endereco_completo"])
-                    if match:
-                        prop.numero = match.group(1)
+            if details.get("anunciante_tipo"):
+                prop.anunciante_tipo = details["anunciante_tipo"]
 
-                if details.get("anunciante"):
-                    prop.anunciante = details["anunciante"]
+            if details.get("caracteristicas_condominio"):
+                prop.caracteristicas_condominio = details["caracteristicas_condominio"]
 
-                if details.get("anunciante_tipo"):
-                    prop.anunciante_tipo = details["anunciante_tipo"]
+            if details.get("data_atualizacao"):
+                prop.data_atualizacao = details["data_atualizacao"]
 
-                if details.get("caracteristicas_condominio"):
-                    prop.caracteristicas_condominio = details["caracteristicas_condominio"]
-
-                if details.get("data_atualizacao"):
-                    prop.data_atualizacao = details["data_atualizacao"]
-
-                if details.get("data_publicacao"):
-                    prop.data_publicacao = details["data_publicacao"]
-
-            finally:
-                await page.close()
-                await detail_context.close()
+            if details.get("data_publicacao"):
+                prop.data_publicacao = details["data_publicacao"]
 
         except Exception as e:
-            logger.debug(f"Erro ao buscar detalhes: {e}")
+            logger.debug(f"Erro ao buscar detalhes de {prop.id}: {e}")
+
+        finally:
+            await page.close()
 
         return prop
 
@@ -287,7 +273,7 @@ class HTMLExtractor:
             # IPTU - busca valor numérico após "IPTU"
             iptu_match = re.search(r'IPTU[:\s]*R?\$?\s*([\d.,]+)', page_text, re.IGNORECASE)
             if iptu_match:
-                details["iptu"] = self._parse_price(iptu_match.group(1))
+                details["iptu"] = Property.parse_price(iptu_match.group(1))
 
             # Endereço completo
             endereco_elem = await page.query_selector('[data-testid="address-text"], [class*="address"], [class*="location"] h1, [class*="Address"]')
@@ -362,33 +348,10 @@ class HTMLExtractor:
                     break
 
         except Exception as e:
-            import traceback
             logger.error(f"Erro ao extrair dados de detalhe: {e}")
             logger.error(traceback.format_exc())
 
         return details
-
-    def _parse_price(self, text: str) -> float:
-        """Converte texto de preço para float."""
-        if not text:
-            return 0.0
-
-        clean = re.sub(r'[^\d.,]', '', text)
-        if not clean:
-            return 0.0
-
-        if ',' in clean and '.' in clean:
-            if clean.rfind(',') > clean.rfind('.'):
-                clean = clean.replace('.', '').replace(',', '.')
-            else:
-                clean = clean.replace(',', '')
-        elif ',' in clean:
-            clean = clean.replace(',', '.')
-
-        try:
-            return float(clean)
-        except ValueError:
-            return 0.0
 
     async def __aenter__(self):
         await self.start()

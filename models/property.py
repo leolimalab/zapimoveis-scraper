@@ -1,8 +1,12 @@
 """Modelo de dados para imóveis."""
 
+import logging
+import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Optional, List
+
+logger = logging.getLogger("zapimoveis_scraper.property")
 
 
 @dataclass
@@ -162,7 +166,6 @@ class Property:
             # Vagas
             vagas = 0
             if "vaga" in name.lower():
-                import re
                 match = re.search(r'(\d+)\s*vaga', name.lower())
                 if match:
                     vagas = int(match.group(1))
@@ -237,24 +240,33 @@ class Property:
             )
 
         except Exception as e:
+            logger.warning(f"Erro ao criar Property de schema.org: {e}")
             return None
 
     @staticmethod
-    def _parse_price(value) -> float:
-        """Converte valor de preço para float."""
+    def parse_price(value) -> float:
+        """Converte valor de preço para float.
+
+        Suporta formatos brasileiro (1.000,50) e americano (1,000.50).
+        """
         if isinstance(value, (int, float)):
             return float(value)
-        if isinstance(value, str):
-            cleaned = "".join(c for c in value if c.isdigit() or c in ".,")
-            if "," in cleaned and "." in cleaned:
-                if cleaned.rfind(",") > cleaned.rfind("."):
-                    cleaned = cleaned.replace(".", "").replace(",", ".")
-                else:
-                    cleaned = cleaned.replace(",", "")
-            elif "," in cleaned:
-                cleaned = cleaned.replace(",", ".")
-            try:
-                return float(cleaned) if cleaned else 0.0
-            except ValueError:
-                return 0.0
-        return 0.0
+        if not isinstance(value, str):
+            return 0.0
+
+        cleaned = re.sub(r'[^\d.,]', '', value)
+        if not cleaned:
+            return 0.0
+
+        if "," in cleaned and "." in cleaned:
+            if cleaned.rfind(",") > cleaned.rfind("."):
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
+        elif "," in cleaned:
+            cleaned = cleaned.replace(",", ".")
+
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
