@@ -1,11 +1,13 @@
 """Extrator de dados diretamente do HTML via Playwright."""
 
 import asyncio
+import glob
 import json
 import logging
 import random
 import re
 import traceback
+from pathlib import Path
 from typing import List, Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
@@ -37,14 +39,26 @@ class HTMLExtractor:
 
         self._playwright = await async_playwright().start()
 
-        self._browser = await self._playwright.chromium.launch(
-            headless=ScraperConfig.HEADLESS,
-            args=[
+        # Tenta usar o executável padrão; se não existir, busca no cache
+        launch_kwargs = {
+            "headless": ScraperConfig.HEADLESS,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
             ],
-        )
+        }
+
+        # Detecta executável do Chromium disponível no cache do Playwright
+        cache_dir = Path.home() / ".cache" / "ms-playwright"
+        for pattern in ["chromium-*/chrome-linux/chrome", "chromium_headless_shell-*/chrome-linux/headless_shell"]:
+            matches = sorted(glob.glob(str(cache_dir / pattern)), reverse=True)
+            if matches:
+                launch_kwargs["executable_path"] = matches[0]
+                logger.info(f"Usando Chromium: {matches[0]}")
+                break
+
+        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
 
         self._context = await self._browser.new_context(
             user_agent=ScraperConfig.USER_AGENT,
