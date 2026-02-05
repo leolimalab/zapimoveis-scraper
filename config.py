@@ -8,36 +8,38 @@ class ScraperConfig:
 
     # URLs
     BASE_URL = "https://www.zapimoveis.com.br"
-    API_URL = "https://glue-api.zapimoveis.com.br/v2/listings"
 
-    # Localização (fixo para Leme)
+    # Localização padrão
     NEIGHBORHOOD = "Leme"
     CITY = "Rio de Janeiro"
+    STATE = "RJ"
     ZONE = "Zona Sul"
-    LAT = "-22.961655"
-    LON = "-43.165463"
+
+    # Busca
+    SEARCH_TERM = ""  # Termo de busca livre (ex: "Rua Gustavo Sampaio")
 
     # Paginação
-    PAGE_SIZE = 30  # Schema.org retorna 30 por página
+    PAGE_SIZE = 30
     MAX_ITEMS = 100
-    MAX_PAGES = 5  # 100 / 30 ≈ 4 páginas
+    MAX_PAGES = 5
 
     # Browser
     HEADLESS = True
-
-    # Retry
-    MAX_RETRIES = 5
-    BASE_DELAY = 1.0
-    MAX_DELAY = 60.0
 
     # Rate limiting
     REQUEST_DELAY_MIN = 1.0
     REQUEST_DELAY_MAX = 3.0
 
+    # Paralelismo no enriquecimento de detalhes
+    DETAIL_CONCURRENCY = 3
+
+    # Imagens
+    MAX_IMAGES = 10
+
     # Output
     OUTPUT_DIR = Path(__file__).parent / "output"
-    CSV_FILENAME = "imoveis_leme.csv"
-    JSON_FILENAME = "imoveis_leme.json"
+    CSV_FILENAME = "imoveis.csv"
+    JSON_FILENAME = "imoveis.json"
     LOG_FILENAME = "scraper.log"
 
     # Headers base
@@ -48,35 +50,22 @@ class ScraperConfig:
     )
 
     @classmethod
-    def get_api_params(cls, page: int = 1) -> dict:
-        """Retorna parâmetros para requisição da API."""
-        from_index = (page - 1) * cls.PAGE_SIZE
-        return {
-            "business": "SALE",
-            "listingType": "USED",
-            "addressCity": cls.CITY,
-            "addressZone": cls.ZONE,
-            "addressNeighborhood": cls.NEIGHBORHOOD,
-            "addressPointLat": cls.LAT,
-            "addressPointLon": cls.LON,
-            "addressType": "neighborhood",
-            "unitTypes": "APARTMENT",
-            "unitTypesV3": "APARTMENT",
-            "usageTypes": "RESIDENTIAL",
-            "page": page,
-            "size": cls.PAGE_SIZE,
-            "from": from_index,
-            "includeFields": "search,listings",
-        }
+    def get_search_url(cls, page_num: int = 1) -> str:
+        """Constrói a URL de busca baseada na configuração atual."""
+        city_slug = cls.CITY.lower().replace(" ", "-")
+        state_slug = cls.STATE.lower()
+        zone_slug = cls.ZONE.lower().replace(" ", "-")
+        neighborhood_slug = cls.NEIGHBORHOOD.lower().replace(" ", "-")
 
-    @classmethod
-    def get_headers(cls) -> dict:
-        """Retorna headers para requisição."""
-        return {
-            "User-Agent": cls.USER_AGENT,
-            "Referer": f"{cls.BASE_URL}/",
-            "Origin": cls.BASE_URL,
-            "Accept": "application/json",
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-            "x-domain": ".zapimoveis.com.br",
-        }
+        base_path = (
+            f"{cls.BASE_URL}/venda/apartamentos/"
+            f"{state_slug}+{city_slug}+{zone_slug}+{neighborhood_slug}/"
+        )
+
+        params = []
+        if page_num > 1:
+            params.append(f"pagina={page_num}")
+        if cls.SEARCH_TERM:
+            params.append(f"busca={cls.SEARCH_TERM.replace(' ', '+')}")
+
+        return f"{base_path}?{'&'.join(params)}" if params else base_path

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Optional, List
 
+from config import ScraperConfig
+
 logger = logging.getLogger("zapimoveis_scraper.property")
 
 
@@ -68,7 +70,7 @@ class Property:
         data["data_extracao"] = self.data_extracao.isoformat()
         data["caracteristicas_imovel"] = "; ".join(self.caracteristicas_imovel)
         data["caracteristicas_condominio"] = "; ".join(self.caracteristicas_condominio)
-        data["imagens"] = "; ".join(self.imagens[:5])  # Limita a 5 imagens
+        data["imagens"] = "; ".join(self.imagens[:ScraperConfig.MAX_IMAGES])
         return data
 
     def to_csv_row(self) -> dict:
@@ -136,10 +138,15 @@ class Property:
             numero = ""
             rua = street
 
-            # Bairro
-            neighborhood = "Leme"
-            if "Copacabana" in name or "Copacabana" in street:
-                neighborhood = "Copacabana"
+            # Bairro — extrair do schema.org ou da URL
+            neighborhood = address.get("addressNeighborhood", "") or ""
+            if not neighborhood:
+                # Fallback: tenta extrair do nome do anúncio
+                for token in name.replace(",", " ").split(" - "):
+                    token = token.strip()
+                    if token and token[0].isupper() and "m²" not in token and "quarto" not in token.lower():
+                        neighborhood = token
+                        break
 
             # Endereço completo
             endereco_completo = f"{street} - {neighborhood}, {city} - {state}" if street else f"{neighborhood}, {city} - {state}"
@@ -236,7 +243,7 @@ class Property:
                 caracteristicas_imovel=caracteristicas,
                 caracteristicas_condominio=[],  # Será extraído da página de detalhe
                 pets_permitidos=pets,
-                imagens=images[:10] if images else [],
+                imagens=images[:ScraperConfig.MAX_IMAGES] if images else [],
             )
 
         except Exception as e:

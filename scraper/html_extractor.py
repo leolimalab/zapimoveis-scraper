@@ -72,8 +72,7 @@ class HTMLExtractor:
         page_num = 1
 
         while len(all_properties) < max_items:
-            base_path = f"{ScraperConfig.BASE_URL}/venda/apartamentos/rj+rio-de-janeiro+zona-sul+leme/"
-            url = base_path if page_num == 1 else f"{base_path}?pagina={page_num}"
+            url = ScraperConfig.get_search_url(page_num)
 
             logger.info(f"Extraindo página {page_num}: {url}")
 
@@ -139,7 +138,15 @@ class HTMLExtractor:
 
             try:
                 await page.goto(url, wait_until="networkidle", timeout=60000)
-                await asyncio.sleep(5)
+
+                # Aguarda seletor de listagem (mais rápido que sleep fixo)
+                try:
+                    await page.wait_for_selector(
+                        'script[type="application/ld+json"]',
+                        timeout=10000,
+                    )
+                except Exception:
+                    pass  # Timeout — continua tentando extrair
 
                 # Extrai dados do schema.org
                 json_data = await self._extract_schema_org(page)
@@ -188,27 +195,33 @@ class HTMLExtractor:
         return None
 
     async def _enrich_properties(self, properties: List[Property]) -> List[Property]:
-        """Enriquece propriedades com dados das páginas de detalhe."""
-        enriched = []
+        """Enriquece propriedades com dados das páginas de detalhe.
+
+        Usa semáforo para limitar concorrência e evitar bloqueio anti-bot.
+        """
+        semaphore = asyncio.Semaphore(ScraperConfig.DETAIL_CONCURRENCY)
         total = len(properties)
+        counter = {"done": 0}
 
-        for i, prop in enumerate(properties):
-            logger.info(f"Buscando detalhes {i+1}/{total}: {prop.id}")
+        async def _enrich_one(prop: Property) -> Property:
+            async with semaphore:
+                counter["done"] += 1
+                logger.info(f"Buscando detalhes {counter['done']}/{total}: {prop.id}")
+                try:
+                    result = await self._fetch_property_details(prop)
+                except Exception as e:
+                    logger.warning(f"Erro ao buscar detalhes de {prop.id}: {e}")
+                    result = prop
 
-            try:
-                enriched_prop = await self._fetch_property_details(prop)
-                enriched.append(enriched_prop)
+                # Delay para rate limiting
+                delay = random.uniform(
+                    ScraperConfig.REQUEST_DELAY_MIN,
+                    ScraperConfig.REQUEST_DELAY_MAX,
+                )
+                await asyncio.sleep(delay)
+                return result
 
-                # Delay entre requisições
-                if i < total - 1:
-                    delay = random.uniform(1.0, 2.0)
-                    await asyncio.sleep(delay)
-
-            except Exception as e:
-                logger.warning(f"Erro ao buscar detalhes de {prop.id}: {e}")
-                enriched.append(prop)
-
-        return enriched
+        return await asyncio.gather(*[_enrich_one(p) for p in properties])
 
     async def _fetch_property_details(self, prop: Property) -> Property:
         """Busca dados adicionais da página de detalhe do imóvel."""
@@ -216,11 +229,18 @@ class HTMLExtractor:
 
         try:
             await page.goto(prop.url, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(3)
 
-            # Verifica se página carregou corretamente (não é Cloudflare challenge)
-            page_text = await page.evaluate("() => document.body.innerText")
-            if len(page_text) < 1000:
+            # Aguarda indicador de conteúdo carregado
+            try:
+                await page.wait_for_selector(
+                    '[data-testid*="price"], [class*="price"], [class*="Price"]',
+                    timeout=8000,
+                )
+            except Exception:
+                pass  # Timeout — verifica via Cloudflare check abaixo
+
+            # Verifica se página foi bloqueada por Cloudflare
+            if await self._is_cloudflare_blocked(page):
                 logger.warning(f"Página bloqueada pelo Cloudflare para {prop.id}")
                 return prop
 
@@ -280,46 +300,15 @@ class HTMLExtractor:
             if endereco_elem:
                 details["endereco_completo"] = await endereco_elem.inner_text()
 
-            # Anunciante - extrair do elemento com data-testid que contém "advertiser"
-            advertiser_elem = await page.query_selector('[data-testid*="advertiser"]')
-            if advertiser_elem:
-                advertiser_text = await advertiser_elem.inner_text()
-                # Formato concatenado: "Anunciante PremiumOrla Rio ImóveisAnunciante verificado..."
-                # Extrair entre "Premium" e "Anunciante verificado"
-                anunc_match = re.search(r'Premium([A-Za-zÀ-ú\s]+?)(?:Anunciante|Creci|Este)', advertiser_text)
-                if anunc_match:
-                    details["anunciante"] = anunc_match.group(1).strip()
-                else:
-                    # Fallback: busca padrão "Nome Imóveis"
-                    name_match = re.search(r'([A-Z][a-zA-Zá-ú\s]+(?:Imóveis|Imobiliária|Corretor))', advertiser_text)
-                    if name_match:
-                        details["anunciante"] = name_match.group(1).strip()
+            # Anunciante — busca por seletores CSS com múltiplos fallbacks
+            advertiser = await self._extract_advertiser(page)
+            if advertiser.get("nome"):
+                details["anunciante"] = advertiser["nome"]
+            if advertiser.get("tipo"):
+                details["anunciante_tipo"] = advertiser["tipo"]
 
-            # Fallback para anunciante no texto da página
-            if not details.get("anunciante"):
-                # Busca padrão "Nome Imóveis" ou similar na página completa
-                anunc_match = re.search(r'([A-Z][a-zA-Zá-ú\s]+(?:Imóveis|Imobiliária))', page_text)
-                if anunc_match:
-                    details["anunciante"] = anunc_match.group(1).strip()
-
-            # Tipo de anunciante
-            if "imobiliária" in page_text.lower() or "creci" in page_text.lower():
-                details["anunciante_tipo"] = "Imobiliária"
-            elif "proprietário" in page_text.lower() or "particular" in page_text.lower():
-                details["anunciante_tipo"] = "Proprietário"
-            elif "incorporadora" in page_text.lower():
-                details["anunciante_tipo"] = "Incorporadora"
-
-            # Características do condomínio
-            caract_cond = []
-            cond_features = [
-                "Piscina", "Academia", "Salão de festas", "Churrasqueira",
-                "Playground", "Sauna", "Quadra", "Portaria 24h", "Segurança",
-                "Jardim", "Elevador", "Bicicletário", "Lavanderia",
-            ]
-            for feature in cond_features:
-                if feature.lower() in page_text.lower():
-                    caract_cond.append(feature)
+            # Características do condomínio — busca em seções específicas do DOM
+            caract_cond = await self._extract_condominium_features(page)
             if caract_cond:
                 details["caracteristicas_condominio"] = caract_cond
 
@@ -352,6 +341,139 @@ class HTMLExtractor:
             logger.error(traceback.format_exc())
 
         return details
+
+    async def _extract_advertiser(self, page: Page) -> dict:
+        """Extrai informações do anunciante via seletores CSS.
+
+        Usa múltiplos seletores para resiliência contra mudanças no DOM.
+        """
+        result = {}
+
+        # Seletores para o nome do anunciante (do mais específico ao mais genérico)
+        name_selectors = [
+            '[data-testid*="advertiser-name"]',
+            '[data-testid*="advertiser"] h2',
+            '[data-testid*="advertiser"] [class*="name"]',
+            '[class*="AdvertiserName"]',
+            '[class*="advertiser"] [class*="name"]',
+        ]
+
+        for selector in name_selectors:
+            try:
+                elem = await page.query_selector(selector)
+                if elem:
+                    text = (await elem.inner_text()).strip()
+                    if text and len(text) < 100:
+                        result["nome"] = text
+                        break
+            except Exception:
+                continue
+
+        # Fallback: extrair do container inteiro do anunciante com regex
+        if not result.get("nome"):
+            try:
+                container = await page.query_selector('[data-testid*="advertiser"]')
+                if container:
+                    text = await container.inner_text()
+                    # Tenta extrair nome de imobiliária/corretor
+                    match = re.search(
+                        r'([A-ZÀ-Ú][a-zA-Zà-ú\s]+(?:Imóveis|Imobiliária|Corretor|Construtora))',
+                        text,
+                    )
+                    if match:
+                        result["nome"] = match.group(1).strip()
+            except Exception:
+                pass
+
+        # Tipo do anunciante — extrair do container específico
+        type_selectors = [
+            '[data-testid*="advertiser-type"]',
+            '[data-testid*="advertiser"] [class*="type"]',
+            '[data-testid*="advertiser"] [class*="badge"]',
+        ]
+
+        for selector in type_selectors:
+            try:
+                elem = await page.query_selector(selector)
+                if elem:
+                    text = (await elem.inner_text()).strip().lower()
+                    if "imobiliária" in text or "creci" in text:
+                        result["tipo"] = "Imobiliária"
+                    elif "proprietário" in text or "particular" in text:
+                        result["tipo"] = "Proprietário"
+                    elif "incorporadora" in text or "construtora" in text:
+                        result["tipo"] = "Incorporadora"
+                    break
+            except Exception:
+                continue
+
+        return result
+
+    @staticmethod
+    async def _is_cloudflare_blocked(page: Page) -> bool:
+        """Detecta bloqueio do Cloudflare por indicadores específicos."""
+        try:
+            indicators = await page.evaluate("""
+                () => ({
+                    title: document.title,
+                    hasCfChallenge: !!document.querySelector('#challenge-running, #cf-challenge-running'),
+                    hasRayId: !!document.querySelector('.ray-id, [data-ray]'),
+                    bodyText: (document.body.innerText || '').substring(0, 500),
+                })
+            """)
+
+            title = indicators.get("title", "").lower()
+            body = indicators.get("bodyText", "").lower()
+
+            if indicators.get("hasCfChallenge") or indicators.get("hasRayId"):
+                return True
+            if "just a moment" in title or "attention required" in title:
+                return True
+            if "checking your browser" in body or "ray id" in body:
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    async def _extract_condominium_features(self, page: Page) -> List[str]:
+        """Extrai características do condomínio de seções específicas do DOM.
+
+        Busca em containers de amenities/features ao invés de texto livre,
+        evitando falsos positivos de palavras que aparecem na descrição.
+        """
+        features = []
+
+        # Seletores que apontam para seções de amenidades do ZapImóveis
+        selectors = [
+            '[data-testid*="amenities"] li',
+            '[data-testid*="features"] li',
+            '[class*="amenities"] li',
+            '[class*="Features"] li',
+            'section:has(h2:text-matches("Condomínio|Lazer|Comodidades", "i")) li',
+        ]
+
+        for selector in selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+                for el in elements:
+                    text = (await el.inner_text()).strip()
+                    if text and len(text) < 60:
+                        features.append(text)
+                if features:
+                    break
+            except Exception:
+                continue
+
+        # Deduplica preservando ordem
+        seen = set()
+        unique = []
+        for f in features:
+            if f.lower() not in seen:
+                seen.add(f.lower())
+                unique.append(f)
+
+        return unique
 
     async def __aenter__(self):
         await self.start()
